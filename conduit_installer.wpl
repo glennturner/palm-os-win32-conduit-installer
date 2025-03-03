@@ -1,0 +1,854 @@
+#!C:\Perl\bin\perl.exe -w
+
+use Win32;
+use Win32::GUI;
+use Win32::GUI::Loft::Design;
+use Win32::Shortcut;
+use File::Copy;
+use File::Path;
+use InstallerInspector;
+
+# error checking 
+eval { __PACKAGE__->main(); };
+Win32::GUI::MessageBox(0, "Error: $@", "Conduit Installer Error") if($@);
+
+sub main {	
+	my $class = shift;
+	my $argv = { @_ };
+	
+	for (@ARGV) { $class->{noReset} = 1 if $_ eq '-noReset'; }
+	
+	# defaults
+	$class->{companyName} = 'Stand Alone, Inc';
+	$class->{softwareRegName} = 'Stand Alone, Inc.';
+	
+	# extract gui schema file
+	my $fileWindow = PerlApp::extract_bound_file('conduit_installer.gld');
+	$class->{windowName} = 'winConduitInstaller1';
+	
+	# build window
+	my $objInspector = InstallerInspector->new() or die("Could not create Inspector}\n");
+	my $objDesign = Win32::GUI::Loft::Design->newLoad($fileWindow) or die "Could not open window file ($fileWindow)";	
+	$objDesign->buildWindow(undef,$objInspector) or die "Could not build window ($fileWindow)";
+	
+	my $win = $Win32::GUI::Loft::window{$class->{windowName}};
+	my $design = $Win32::GUI::Loft::design{$class->{windowName}};
+	$class->{win} = $win;
+	
+	# center window
+	my $desk = Win32::GUI::GetDesktopWindow();
+    my $dw = Win32::GUI::Width($desk);
+    my $dh = Win32::GUI::Height($desk);
+    my $x = ($dw - $win->Width()) / 2;
+    my $y = ($dh - $win->Height()) / 2;
+    $win->Move($x, $y);
+	
+	# change window icon	
+	my $ico = PerlApp::extract_bound_file('installer.ico');
+	my $guiIco = Win32::GUI::Icon->new($ico);
+	$win->ChangeIcon($guiIco);
+	
+	# get conduit, registry and app data
+	my $conduitData = $class->getConduitData;
+	Win32::GUI::MessageBox(0, "Cannot install conduit - conduit data not found in database", "Conduit Installer Error") if (!$conduitData and !$class->{conduitName});	
+	my $regData = $class->getRegistryData;
+	Win32::GUI::MessageBox(0, "Palm Desktop not found on this computer - this conduit cannot be installed correctly if it cannot locate your Palm Desktop program.", "Conduit Installer Error") if (!$regData and !$class->{palmDesktopRegKey});	
+	my $apps = $class->getAppsData;	
+	
+	# insert variables into controls	
+	$class->{uninstallName} = "Uninstall $class->{conduitName}";
+	$win->Text("$class->{conduitName} Installer");
+	# insert header lable
+	# needs to be bolded, so we can't use TGL for this
+	my $font = Win32::GUI::Font->new(
+		-size	=> 9,
+		-bold	=> 1,
+	);
+	$win->AddLabel(
+		-font				=> $font,
+		-text				=> "Install $class->{conduitName}",
+		-name				=> 'lblHeaderText',
+		-background	=> [ 255,255,255 ],
+		-top					=> 9,
+		-left					=> 16,		
+	);
+
+	# insert conduit checkbox
+	my $conduitNode = $win->AddCheckbox(
+		-name				=> 'chbConduit',
+		-text				=> $class->{conduitName},
+		-default			=> '1',
+		-top					=> 90,
+		-left					=> 20,
+		-checked			=> 1,
+		-tabstop			=> 1,
+	);
+	
+	push @{$class->{appDescr}}, $class->{conduitDescr};
+	$class->{clusters}->{clsApps} = ['chbConduit'];
+	if ($class->{apps} and @{$class->{apps}} and scalar @{$class->{apps}} > 0)  {
+		for my $i (0 .. (scalar @{$class->{apps}}-1)) {
+			my $prior;
+			$prior = 'chbApp'.($i-1) if $i != 0;
+			$prior = 'chbConduit' if $i == 0;
+			my $name = 'chbApp'.$i;
+			$win->AddCheckbox(
+				-name				=> $name,
+				-text				=> $class->{apps}->[$i]->{appName},
+				-default			=> '1',
+				-top					=> ($win->$prior->Top+20) ? ($win->$prior->Top+20) : ($win->chbConduit->Top+20),
+				-left					=> $win->chbConduit->Left,
+				-checked			=> $class->{apps}->[$i]->{appActive},
+				-tabstop			=> 1,
+			);
+			push @{$class->{clusters}->{clsApps}}, $name;
+			push @{$class->{appDescr}}, $class->{apps}->[$i]->{appDescr};
+		}
+	}
+	
+	$class->{step} = 'clsInit';
+	$class->{step} = 'clsPostInit' if $class->{conduitExists};
+	$win = $class->showClusters(step=>$class->{step});
+	
+	$win->Show();
+	Win32::GUI::Dialog();
+
+	return 1;
+}
+
+# extract conduit data for specific app or first active conduit from conduit-data.db and insert into self
+sub getConduitData {
+	my $self = shift;
+	my $argv = { @_ };
+	
+	my $db = PerlApp::get_bound_file('packages.db');
+	
+	my ($conduit) = $db=~/^1\s{1,}(.*)/m;
+	($self->{conduitName},$self->{conduitSize},$self->{conduitDescr},$self->{conduitFilename},$self->{conduitCreator},$self->{conduitRegName},$self->{conduitFile0},$self->{conduitPriority},$self->{conduitRemote0},$self->{appGroup}) = $conduit=~/(.*?)\=(.*?)\=(.*?)\t{1,}(.*?)\t{1,}'(.*?)'\t{1,}(.*?)\t{1,}(.*?)\t{1,}(\d{1,})\t{1,}(.*?)\t{1,}(.*?)\s{0,}$/;
+	
+	return 1;
+}
+
+sub getAppsData {
+	my $self = shift;
+	my $argv = { @_ };
+	
+	my $db = PerlApp::get_bound_file('packages.db');
+	
+	my @apps;
+	for my $app ($db=~/^([01]\t{1,}[^\t]*?\=[^\t]*?\=[^\t]*?\t{1,}[^\t]*?)[\s^\t]{0,}$/gm) {
+		my $tmp = {};
+		($tmp->{appActive},$tmp->{appName},$tmp->{appSize},$tmp->{appDescr},$tmp->{appFilename}) = $app=~/^([01])\t{1,}([^\t]*?)\=([^\t]*?)\=([^\t]*?)\t{1,}([^\t]*?)$/;
+		push @apps, { %{$tmp} } if $tmp->{appName};
+	}
+	
+	$self->{apps} = [ @apps ] if scalar @apps > 0;
+	return \@apps;
+}
+
+sub installConduit {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	# update local registry values in script, just in case.
+	#$self->getRegistryData;
+	
+	$win->pbInstall->SetRange(0,4) if !$self->{apps};
+	$win->pbInstall->SetRange(0,(4+scalar @{$self->{apps}})) if $self->{apps};
+	
+	eval { mkpath($self->{path}) };
+	if ($@) {
+		Win32::GUI::MessageBox(0, "$self->{path} could not be created, please pick a new directory.", "Conduit Installer Error");
+		$self->showClusters(step=>'clsConduitPath');
+		return;
+	}
+	
+	# install driver
+	$win->lblInstallProgress->Text("Installing $self->{conduitName} driver...");
+	my $dll = PerlApp::get_bound_file($self->{conduitFilename});
+	
+	if ($dll) {
+		open(DLL,">$self->{path}/$self->{conduitFilename}") or Win32::GUI::MessageBox(0, "Cannot install $self->{conduitFilename} to $self->{path}: $!", "Conduit Installer Error");
+		binmode DLL;
+		print DLL $dll;
+		close DLL;
+		$win->pbInstall->StepIt;
+	} else {		
+		Win32::GUI::MessageBox(0, "Cannot install $self->{conduitFilename} to $self->{path}: The file was not included with this installer.", "Conduit Installer Error");
+	}
+	
+	# Set up  Software > $softwareRegName > Uninstall registry stuff
+	$self->{uninstallReg}->{"$self->{conduitName}/"} = {
+		'/DisplayName'		=> $self->{conduitName},
+		'/UninstallString'	=> "$self->{programFilesPath}\\$self->{uninstallName}.exe -noReset",
+		'/PalmPath'				=> $self->{path},
+		'/appPath'				=> $self->{programFilesPath},
+		'/DisplayIcon'			=> "$self->{programFilesPath}\\$self->{conduitName}.ico,-0",
+	};
+	
+	# install applications
+	$self->installApps;
+	
+	$win->lblInstallProgress->Text("Adding $self->{conduitName} registry entry...");	
+	$self->{conduitCreatorRev} = reverse($self->{conduitCreator});
+	# remove current QN reg key if exists
+	
+	$self->{palmDesktopRegKey}->{"Application$self->{conduitNumber}/"} = { 
+		'/Conduit'	=> $self->{conduitFilename},
+		'/Creator'	=> [ $self->{conduitCreatorRev}, 'REG_DWORD' ],
+		'/File0'			=> $self->{conduitFile0},
+		'/Name'		=> $self->{conduitRegName},
+		'/PalmPath'	=> $self->{path},
+		'/Priority'		=> [ "0x".sprintf("%08d",$self->{conduitPriority}), 'REG_DWORD' ],
+		'/Remote0'	=> $self->{conduitRemote0},
+	};	
+	$win->pbInstall->StepIt;
+	
+	# what if HotSync Manager requires confirmation to shut down?
+	# then temporarily rewrite DontAskExit to 1
+	if (!$self->{noReset}) {
+		my $dontAskExit;
+		$dontAskExit = 1 if ($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} and hex($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit}) eq '1');
+		$self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} = [ "0x".sprintf("%08d",1), 'REG_DWORD' ] if !$dontAskExit;
+		
+		# find and close HotSync Manager
+		if (hex($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit}) == 1) {
+			my $scClose = 0xF060;
+			my $wmSysCommand = 0x0112;
+			
+			$win->lblInstallProgress->Text('Finding HotSync Manager');
+			my $netsync = Win32::GUI::FindWindow('KittyHawk', 'Hotsync Manager');
+			$win->pbInstall->StepIt;
+			$win->lblInstallProgress->Text('Resetting HotSync Manager...');
+			
+			my $shell;		
+			if ($netsync) {
+				$shell = Win32::GUI::SendMessageTimeout($netsync, $wmSysCommand, $scClose, 10, 1, 10);		
+			}
+			
+			$self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} = [ "0x".sprintf("%08d",0), 'REG_DWORD' ] if !$dontAskExit;
+			
+			# start up HotSync Manager again
+			if ($self->{hotSyncPath}) {
+			 	my $shellEx = $win->ShellExecute('open',"$self->{hotSyncPath}",'','',10);
+				while (!$shellEx) {
+					Win32::GUI::DoEvents() >= 0 or die "Window was closed during processing";
+			  		sleep 2; #body of the loop...
+			  		$shellEx = 1;
+			  	}
+			}
+		} else {
+			$self->alertResetHotsync();	
+		}
+		$win->pbInstall->StepIt;
+	} else {
+		$self->alertResetHotsync();
+	}
+	
+	$win->lblInstallProgress->Text("$self->{conduitName} installed.");
+	$win->pbInstall->Hide;	
+	
+	return 1;
+}
+
+sub installApps {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	
+	# sniff to make sure 
+	eval { mkpath($self->{programFilesPath}) };
+	if ($@) {
+		Win32::GUI::MessageBox(0, "$self->{programFilesPath} could not be created, please pick a new directory.", "Conduit Installer Error");
+		$self->showClusters(step=>'clsAppsPath');
+		return;
+	}
+	
+	if ($self->{installGroup}) {
+		eval { mkpath($self->{commonPrograms}) };
+		if ($@) {
+			Win32::GUI::MessageBox(0, "$self->{commonPrograms} could not be saved to", "Conduit Installer Error");
+			return;
+		}
+	}
+	
+	# copy installer to program file folder and commonPrograms for future install modification/uninstall
+	my $installer = "$self->{programFilesPath}\\$self->{uninstallName}.exe";
+	copy(PerlApp::exe,$installer) if PerlApp::exe ne $installer;
+	if ($self->{installGroup}) {
+		my $lnk = new Win32::Shortcut;
+		$lnk->{'Path'} = $installer;
+		$lnk->{'Description'} = 'Uninstall or Reinstall $self->{conduitName}';
+		$lnk->Save($self->{commonPrograms}.'/'.$self->{uninstallName}.'.lnk');
+	}
+	# save icon
+	my $ico = PerlApp::get_bound_file('installer.ico');
+	open(ICO,">$self->{programFilesPath}/$self->{conduitName}.ico");
+	binmode ICO;
+	print ICO $ico;
+	close(ICO);
+	
+	# copy to programs folder
+	if ($self->{apps}) {
+		for my $i (0 .. (scalar @{$self->{apps}}-1)) {
+			my $app = $self->{apps}->[$i];
+			next if !$self->{installApps}->{$app->{appName}};
+			$win->lblInstallProgress->Text("Installing $app->{appName}...");
+			my $appScal = PerlApp::get_bound_file($app->{appFilename});
+			Win32::GUI::MessageBox(0, "Cannot install $app->{appFilename} to $self->{programFilesPath}: The file was not included with this installer.", "Conduit Installer Error") and next if !$appScal;
+			my $appDest = "$self->{programFilesPath}/$app->{appFilename}";
+			open(APP,">$appDest") or Win32::GUI::MessageBox(0, "Cannot install $app->{appFilename} to $self->{programFilesPath}: $!", "Conduit Installer Error");
+			binmode APP;
+			print APP $appScal;
+			close APP;
+			
+			# save shortcuts to commonPrograms
+			# do shortcut stuff
+			if ($self->{installGroup}) {
+				my $lnk = new Win32::Shortcut;
+				$lnk->{'Path'} = $appDest;
+				$lnk->{'Description'} = $app->{appDescr};
+				$lnk->Save($self->{commonPrograms}.'/'.$app->{appName}.'.lnk');
+				$win->lblInstallProgress->Text("Creating shortcut...");
+			}
+			
+			$win->pbInstall->StepIt;
+		}
+	}
+	
+	return 1;
+}
+
+sub removeConduit {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	$win->pbRemove->SetRange(0,4);
+	
+	# remove registry entry
+	$win->lblRemoveProgress->Text("Removing $self->{conduitName} registry entry...");
+	delete $self->{palmDesktopRegKey}->{"Application$self->{conduitNumber}/"};
+	$win->pbRemove->StepIt;
+	
+	# remove driver	
+	$win->lblRemoveProgress->Text("Removing $self->{conduitName}...");
+	unlink "$self->{path}/$self->{conduitFilename}";# or Win32::GUI::MessageBox(0, "Cannot remove $self->{conduitFilename} from $self->{path}: $!", "Conduit Installer Error");
+	$win->pbRemove->StepIt;
+	
+	$self->removeApps;
+	
+	if (!$self->{noReset}) {
+		# find and close HotSync Manager
+		my $scClose = 0xF060;
+		my $wmSysCommand = 0x0112;		
+	
+		# what if HotSync Manager requires confirmation to shut down?
+		# then temporarily rewrite DontAskExit to 1
+		my $dontAskExit;
+		$dontAskExit = 1 if ($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} and hex($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit}) eq '1');
+		$self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} = [ "0x".sprintf("%08d",1), 'REG_DWORD' ] if !$dontAskExit;
+		
+		if (hex($self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit}) == 1) {
+			$win->lblRemoveProgress->Text('Finding HotSync Manager');
+			my $netsync = Win32::GUI::FindWindow('KittyHawk', 'Hotsync Manager');
+			$win->pbRemove->StepIt;
+			$win->lblRemoveProgress->Text('Resetting HotSync Manager...');
+			my $shell = Win32::GUI::SendMessage($netsync, $wmSysCommand, $scClose, 10);
+			$win->pbRemove->StepIt;
+			
+			$self->{palmDesktopRegKey}->{'HotSync Manager'}->{DontAskExit} = [ "0x".sprintf("%08d",0), 'REG_DWORD' ] if $dontAskExit;
+			 
+			# start up HotSync Manager again
+			$shell = $win->ShellExecute('open',"$self->{hotSyncPath}",'','',1);
+		} else {
+			$self->alertResetHotsync();
+		}
+	} else {
+		$self->alertResetHotsync();
+	}
+	$win->pbInstall->Hide;
+	$win->lblRemoveProgress->Text("$self->{conduitName} has been removed");
+	
+	# remove uninstall reg info
+	delete $self->{uninstallReg}->{"$self->{conduitName}/"};
+	
+	return 1;
+}
+
+sub removeApps {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	
+	# remove programs
+	for my $app (@{$self->{apps}}) {
+		$win->lblInstallProgress->Text("Installing $app->{appName}...");
+		my $appScal = PerlApp::get_bound_file($app->{appFilename});
+		unlink "$self->{programFilesPath}/$app->{appFilename}";# or Win32::GUI::MessageBox(0, "Cannot remove $app->{appFilename} from $self->{programFilesPath}: $!", "Conduit Installer Error");
+		unlink $self->{commonPrograms}.'/'.$app->{appName}.'.lnk';# or Win32::GUI::MessageBox(0, "Cannot remove $app->{appFilename} shortcut from $self->{programFilesPath}: $!", "Conduit Installer Error");
+		$win->pbInstall->StepIt;
+	}
+	
+	# delete uninstaller and icon
+	unlink "$self->{programFilesPath}/Uninstall $self->{conduitName}.exe";
+	unlink "$self->{commonPrograms}/Uninstall $self->{conduitName}.lnk";
+	unlink "$self->{programFilesPath}/$self->{conduitName}.ico";
+	
+	# only delete programFilesPath if directory is empty after all apps have been removed
+	opendir(APP,$self->{programFilesPath});
+	my @chkDir;
+	@chkDir = grep(!/^\.{1,2}$/, readdir(APP));
+	closedir(APP);
+	rmdir $self->{programFilesPath} if scalar @chkDir == 0;
+	
+	# only delete commonPrograms path if directory is empty after all apps have been removed
+	opendir(APP,$self->{commonPrograms});
+	my @chkCommonDir;
+	@chkCommonDir = grep(!/^\.{1,2}$/, readdir(APP));
+	closedir(APP);
+	rmdir $self->{commonPrograms} if scalar @chkCommonDir == 0;
+
+	return 1;
+}
+
+# get necessary Palm Desktop and HotSync Manager registry info and insert into self
+sub getRegistryData {
+	my $self = shift;
+	my $argv = { @_ };
+	
+	my $Registry;
+	use Win32::TieRegistry ( TiedRef => \$Registry,  Delimiter => "/" );
+	
+	my $desktop = $Registry->{CUser}->{Software}->{'U.S. Robotics'}->{'Pilot Desktop'};
+	
+	$self->{hotSyncPath} = $desktop->{Core}->{HotSyncPath};
+	$self->{path} = $desktop->{Core}->{DesktopPath} ? $desktop->{Core}->{DesktopPath} : $desktop->{Core}->{Path};
+	$self->{hotSyncDontAskExit} = $desktop->{'HotSync Manager'}->{DontAskExit};
+	$self->{palmDesktopRegKey} = $desktop;
+	
+	my @conduits;
+	my $conduits = {};
+	for (keys %{$desktop}) {
+		# see if Applications value exists and is for the conduit being installed
+		if (
+			my ($appNum) = $_=~/^Application(\d+)/ 
+			and 
+				(
+					($desktop->{$_}->{Name} and $self->{conduitRegName} and $desktop->{$_}->{Name}=~/^$self->{conduitRegName}$/)
+					or
+					($desktop->{$_}->{Conduit} and $self->{conduitFilename} and $desktop->{$_}->{Conduit}=~/^$self->{conduitFilename}$/)
+				)
+			) {
+			$self->{conduitExists} = 1;
+			$self->{conduitNumber} = $appNum;
+			$self->{conduitPath} = $desktop->{$_}->{PalmPath};
+		}
+		#push @conduits, $_=~/^Application(\d+)\/?$/ if $_=~/^Application(\d+)\/?$/;
+		if ($_=~/^Application(\d+)\/?$/) {
+			$conduits->{$1} = 1;
+		}
+	}
+	# need to sort the topmost Applications key
+	if (!$self->{conduitExists}) {
+		@conduits = sort { $b <=> $a } keys %{$conduits};
+		for (0..$conduits[0]+1) {
+			if (!$conduits->{$_}) {
+				$self->{conduitNumber} = $_;
+				last;
+			}
+		} 
+	}
+	
+	# get program files and common programs folder location
+	$self->{programFilesPath} = $Registry->{LMachine}->{Software}->{Microsoft}->{Windows}->{CurrentVersion}->{ProgramFilesDir}.'\\'.$self->{companyName}.'\\'.$self->{appGroup};
+	$self->{commonPrograms} = $Registry->{LMachine}->{Software}->{Microsoft}->{Windows}->{CurrentVersion}->{Explorer}->{'Shell Folders'}->{'Common Programs'}.'\\'.$self->{companyName}.'\\'.$self->{appGroup};
+	Win32::GUI::MessageBox(0, "An error occurred - commonPrograms path could not be located.", "Conduit Installer Error") if !$self->{commonPrograms};
+	
+	
+	# add app info to add/remove programs
+	$self->{uninstallReg} = $Registry->{LMachine}->{Software}->{Microsoft}->{Windows}->{CurrentVersion}->{Uninstall};
+	$self->{path} = $self->{uninstallReg}->{$self->{conduitName}}->{PalmPath} if $self->{uninstallReg}->{$self->{conduitName}}->{PalmPath};
+	$self->{programFilesPath} = $self->{uninstallReg}->{$self->{conduitName}}->{appPath} if $self->{uninstallReg}->{$self->{conduitName}}->{appPath};
+	
+	return;
+}
+
+=head1 NAME
+ managePath
+
+=head2 DESCRIPTION
+ Path verification and creation subroutine
+ 
+=head2 ARGV
+ fwd			=> cluster to show if path exists or if dir is able to be created
+ back		=> cluster to show if invalid path or user doesn't want to create a new dir
+ path		=> path to manage
+ confirm	=> optional, asks user to confirm creation of new directory
+ 
+=head2 RETURNS
+ null
+
+=cut
+sub managePath {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	
+	if (!$self->{$argv->{path}}) {
+		Win32::GUI::MessageBox(0, "No path defined", "Conduit Installer Error");
+		$self->showClusters(step=>$argv->{back});
+	}
+	
+	# check to see if program folder already exists. If not, alert to create it.
+	my $dir = opendir(APPS,"$self->{$argv->{path}}");
+	closedir(APPS);
+	if (!$dir) {
+		my $create;
+		$create = Win32::GUI::MessageBox($win,"$self->{$argv->{path}} does not exist - would you like to create it?","$self->{conduitName}",MB_OKCANCEL) if $argv->{confirm};			
+		
+		if (($create and $create == 1) or !$argv->{confirm}) {
+			# test path, create new directories as needed
+			my $mkdir = [];
+			eval { (@{$mkdir}) = mkpath($self->{$argv->{path}}) };
+			if ($@) {
+				Win32::GUI::MessageBox(0, "$self->{$argv->{path}} could not be created, please pick a new directory.", "Conduit Installer Error");
+				$self->showClusters(step=>$argv->{back});				
+			} else {
+				# remove created test directories
+				for (@{$mkdir}) { rmtree($_); }
+				$self->showClusters(step=>$argv->{fwd});	
+			}
+		} else {
+			$self->showClusters(step=>$argv->{back});
+		}
+	} else {
+		$self->showClusters(step=>$argv->{fwd});	
+	}
+	
+	return;
+}
+
+sub cancelConfirm {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	
+	my $cancel;
+	$cancel = Win32::GUI::MessageBox($win,"Are you sure you want to quit the $self->{conduitName} Installer?","$self->{conduitName}",MB_YESNO);
+	
+	return -1 if $cancel == 6;
+}
+
+sub headerText {
+	my $self = shift;
+	my $argv = { @_ };
+	my $win = $self->{win};
+	return -1 if !$win;
+	
+	my $texts = {
+		'clsInit'				=> "Install $self->{conduitName} to your desktop computer",
+		'clsPostInit'		=> "Reinstall or remove $self->{conduitName}",
+		'clsApps'				=> "Available $self->{conduitName} components for installation",
+		'clsAppsPath'		=> "Install path options for $self->{conduitName}",
+		'clsConduitPath'	=> "Install path options for $self->{conduitName}",
+		'clsInstall'			=> "$self->{conduitName} installation progress",
+		'clsRemove'		=> "$self->{conduitName} removal progress",
+	};
+	
+	return $texts->{$argv->{step}} if $texts->{$argv->{step}};
+	return '' if !$texts->{$argv->{step}};
+}
+
+=head1 NAME
+ showClusters
+
+=head2 DESCRIPTION
+ Toggles control visibilty based on current step ($self->{step}) and inserts conduit variables for display
+ 
+ If controls aren't part of a cluster, you can bind them to one:
+ $self->{cluster}->{$clustername} = ['ctrl1','ctrl2','ctrl3' ];
+ 
+=head2 ARGV
+ win (opt)			=> passed window containing controls to manipulate
+ design (opt)	=> window design, for further control manipulation
+ step				=> name of cluster controls belong to
+
+=head2 RETURNS
+ window
+ 
+=cut
+sub showClusters {
+	my $self = shift;
+	my $argv = { @_ };
+	
+	# default window & design
+	defined(my $win = $Win32::GUI::Loft::window{$self->{windowName}}) or return(1);
+	defined(my $design = $Win32::GUI::Loft::design{$self->{windowName}}) or return(1);
+	
+	# optional arguments
+	$win = $argv->{win} if $argv->{win};
+	$design	= $argv->{design} if $argv->{design};
+	$self->{step} = $argv->{step} if $argv->{step};
+	
+	# toggle visibility for controls in this step/cluster
+	for my $control (@{$design->rhClusterWingc->{$self->{step}}}) {
+		$win->{$control->{-name}}->Show;		
+	}	
+	# for on-the-fly controls
+	for my $ctrl (@{$self->{clusters}->{$self->{step}}}) { $win->$ctrl->Show; }
+	
+	# for embeded header text
+	$win->lblHeaderDescrText->Text($self->headerText(step=>$argv->{step}));
+	
+	# hide non-current clusters
+	for my $cluster (keys %{$design->rhClusterWingc}) {
+		next if $cluster eq $self->{step};
+		for my $control (@{$design->rhClusterWingc->{$cluster}}) {			
+			$win->{$control->{-name}}->Hide;
+		}
+	}	
+	# for on-the-fly controls
+	for my $cluster (keys %{$self->{clusters}}) {
+		next if $cluster eq $self->{step};
+		for my $ctrl (@{$self->{clusters}->{$cluster}}) { $win->$ctrl->Hide; }
+	}
+	
+	# populate control text with $self variables
+	for my $control (keys %{$win}) { 
+		next unless $control!~/^-/  and $win->$control->Text; 
+		for (keys %{$self}) { 
+			my $text = $win->$control->Text;
+			$text=~s/\$$_/$self->{$_}/gs;
+			$win->$control->Text($text);
+		}		
+	}
+	
+	return $win;
+}
+
+sub alertResetHotsync {
+	my $self = shift;
+	
+	Win32::GUI::MessageBox(0, "You must restart your HotSync Manager for the changes to take effect.", "Conduit Installer Note");
+	
+	return 1;	
+}
+
+#### ACTIONS FOLLOW ####
+
+# init next click -> install path 
+sub ::btnInitNext_Click {
+	my $self = __PACKAGE__;
+	
+	# check to see if there are additional apps to be installed
+	# if so, allow user to select what they want to install
+	if ($self->{apps}) {
+		$self->showClusters(step=>'clsApps');
+		$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[0]);
+	} else {
+		$self->showClusters(step=>'clsConduitPath');
+	}
+	
+	return 1;
+}
+
+# if already installed, either let user reinstall or uninstall
+sub ::btnPostInitNext_Click {
+	my $self = __PACKAGE__;	
+	my $win = $self->{win};
+	
+	if ($win->rbInstall->Checked) {
+		::btnInitNext_Click();
+	} elsif ($win->rbRemove->Checked) {
+		my $remove = Win32::GUI::MessageBox($win,"Are you sure you want to remove the $self->{conduitName}?","$self->{conduitName}",MB_OKCANCEL);		
+		# removal
+		if ($remove eq 1) {
+			$self->showClusters(step=>'clsRemove');
+			my $removal = $self->removeConduit();
+			my $close = Win32::GUI::MessageBox($win,"The $self->{conduitName} has been uninstalled.","$self->{conduitName} removed") if $removal;			
+	
+			return -1;
+		}
+	}
+	return 1;
+}
+
+# back click from path to either postInit or init
+sub ::btnPathBack_Click {
+	my $self = __PACKAGE__;
+	
+	$self->showClusters(step=>'clsPostInit') if $self->{conduitExists} and !$self->{apps};
+	$self->showClusters(step=>'clsInit') if !$self->{conduitExists} and !$self->{apps};
+	$self->showClusters(step=>'clsAppsPath') if $self->{apps};
+	
+	return 1;
+}
+
+# file dialog for custom conduit install path
+sub ::btnCustomPathDialog_Click {
+	my $self = __PACKAGE__;
+	my $win = $self->{win};
+	my $folder = Win32::GUI::BrowseForFolder(
+		-title			=> "Folder to install $self->{conduitName} to...",
+		-editbox		=> 1,		
+	);
+
+	# if custom path..
+	if ($folder) {
+		$self->{path} = $folder;	
+		$win->tfCustomPath->Text($folder);
+		$self->{confirm} = 1;
+	}
+	
+	
+	return 1;
+}
+
+sub ::btnPathNext_Click {
+	my $self = __PACKAGE__;
+	my $win = $self->{win};
+	$self->showClusters(step=>'clsInstall');
+	my $install = $self->installConduit;
+	
+	if ($install) {
+		Win32::GUI::MessageBox($win,"The $self->{conduitName} has been installed.","$self->{conduitName} installed");
+		
+		return -1;		
+	}
+	
+	return 1;
+}
+
+# file dialog for custom apps install path
+sub ::btnAppsPathCustom_Click {
+	my $self = __PACKAGE__;
+	my $win = $self->{win};
+	my $folder = Win32::GUI::BrowseForFolder(
+		-title			=> "Folder to install program files to...",
+		-editbox		=> 1,
+	);
+	# if custom path..
+	if ($folder) {
+		$self->{programFilesPath} = $folder;	
+		$win->tfAppsPathCustom->Text($self->{programFilesPath});
+		$self->{confirm} = 1;
+	}
+	
+	return 1;
+}
+
+sub ::btnAppsNext_Click {
+	my $self = __PACKAGE__;	
+	
+	$self->{installConduit} = 1 if $self->{win}->{chbConduit}->GetCheck == 1;
+	$self->{installGroup} = 1 if $self->{win}->{installGroup}->GetCheck == 1;
+	for my $i (0 .. (scalar @{$self->{apps}}-1)) {
+		my $chbName = 'chbApp'.$i;
+		$self->{installApps}->{$self->{apps}->[$i]->{appName}} = 1 if $self->{win}->{$chbName}->GetCheck == 1;
+	}
+	
+	if (!$self->{installConduit} and !$self->{installApps}) {
+		Win32::GUI::MessageBox($self->{win},'You must select a component to install.');
+	} else {
+		$self->showClusters(step=>'clsAppsPath');
+	}
+	
+	return 1;
+}
+
+sub ::btnAppsBack_Click {
+	my $self = __PACKAGE__;	
+	$self->showClusters(step=>'clsInit') if !$self->{conduitExists};
+	$self->showClusters(step=>'clsPostInit') if $self->{conduitExists};
+	
+	return 1;
+}
+
+sub ::btnAppsPathNext_Click {
+	my $self = __PACKAGE__;	
+	my $win = $self->{win};
+	$self->{programFilesPath} = $win->tfAppsPathCustom->Text;
+	my $path = $self->managePath(
+		back		=>'clsAppsPath',
+		fwd			=>'clsConduitPath',
+		path			=>'programFilesPath',
+	#	confirm	=>$self->{confirm}
+	);
+	
+	return 1;
+}
+
+sub ::btnAppsPathBack_Click {
+	my $self = __PACKAGE__;	
+	$self->showClusters(step=>'clsApps');
+	
+	return 1;
+}
+
+# app checkbox description stuff
+sub ::chbConduit_Click {
+	my $self = __PACKAGE__;
+	$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[0]);
+	return 1;
+}
+
+sub ::chbApp0_Click {
+	my $self = __PACKAGE__;
+	$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[1]);
+	return 1;
+}
+
+sub ::chbApp12_Click {
+	my $self = __PACKAGE__;
+	$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[2]);
+	return 1;
+}
+sub ::chbApp2_Click {
+	my $self = __PACKAGE__;
+	$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[3]);
+	return 1;
+}
+sub ::chbApp3_Click {
+	my $self = __PACKAGE__;
+	$self->{win}->lblAppsDescrText->Text($self->{appDescr}->[4]);
+	return 1;
+}
+
+sub ::btnInstallExit_Click { return -1; }
+
+# cancel clicks
+sub ::btnInitCancel_Click { __PACKAGE__->cancelConfirm; }
+sub ::btnPostInitCancel_Click { __PACKAGE__->cancelConfirm; }
+sub ::btnAppsCancel_Click { __PACKAGE__->cancelConfirm; }
+sub ::btnAppsPathCancel_Click { __PACKAGE__->cancelConfirm; }
+sub ::btnConduitPathCancel_Click { __PACKAGE__->cancelConfirm; }
+
+=head2 TITLE
+=item Stand Alone, Inc. Desktop Software & Conduit Installer
+
+=head2 DESCR
+=item Installers using Win32::GUI and TheGuiLoft for a more managable, easily configured installer for users installing Palm Desktop Conduits and Software
+
+=head2 VERSION HISTORY
+v.1.0b6 - Released February 6th, 2007. This version now uses DesktopPath instead of Path regkey. It also fixes several bugs concerning the custom conduit folder window and reassigning the desktop path.
+v.1.0b5 - Released Jan 24th, 2005. Now reverses conduit creator as it appears in packages.db, correcting a crash bug that occurs in more advanced conduits like QN. Also features improved application reg key sniffing.
+v.1.0b3 - Released Jan 13th, 2005. Fixes a problem where DontAskExit was not getting set or sniffed correctly, and also added better error coverage if DontAskExit is not able to be manipulated.
+v.1.0b2 - Released Jan 9th, 2005. Fixes a problem that caused hanging after running installer via add/remove, and also fixes an uninstall problem where QN would not be uninstalled if Name key didn't exist.
+v.1.0b1 - Released January 3rd, 2005. Preliminary test release.
+
+=head2 AUTHOR
+=item Glenn P. Turner for Stand Alone, Inc.
+=item glenn@standalone.com
+
+=BUGS
+	- build directory for perlapp stuff should be app dir, not the directory containing ALL apps?
+		- changing this causes PerlApp to not be able to see InstallerInspector though
+ 
+=head2 TO DO
+	WORKED AROUND - possible bug with add/remove programs?
+		- if removal via add/remove control panel, add/remove becomes unresponsive
+			- am I supposed to return success/failure to it as a parent window?
+			- add/remove is waiting for HotSync reset to finish
+		- just require end user to reset hotsync manually if running installer via uninstallString
+	
+=cut
